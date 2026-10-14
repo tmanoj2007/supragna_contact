@@ -1,0 +1,1138 @@
+From a2ac59999457da8aa0752afccb7b64cd35f77537 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 14 Oct 2026 09:56:15 +0000
+Subject: [PATCH 1/3] Contact: fit map to screen, fix panning bounds, 3D
+ heading
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01W6LfRMYSJ31Q7igqww8gGZ
+---
+ src/pages/Contact.tsx          | 61 +++++++++++++++++++++++++---
+ src/styles/Contact.module.scss | 72 ++++++++++++++++++++++++----------
+ 2 files changed, 108 insertions(+), 25 deletions(-)
+
+diff --git a/src/pages/Contact.tsx b/src/pages/Contact.tsx
+index a55f873..6876c37 100644
+--- a/src/pages/Contact.tsx
++++ b/src/pages/Contact.tsx
+@@ -25,7 +25,7 @@ import pageBg from "../assets/contact/page.webp";
+ import pageMobBg from "../assets/contact/pageMob.webp";
+ 
+ import ContactCard from "../components/ContactCard";
+-import Preloader from "../pages/Preloader"; // ⚠️ verify this path — see chat
++import Preloader from "../pages/Preloader";
+ import { useTransition } from "../context/TransitionProvider";
+ 
+ // ─────────────────────────────────────────────────────────────
+@@ -181,6 +181,9 @@ export default function Contact() {
+   const centerDefaultCard = useRef<(opts?: { instant?: boolean }) => void>(
+     () => {},
+   );
++  // Called when the map image finishes loading (its size is only known then).
++  // Set inside the main effect below.
++  const onMapLoad = useRef<() => void>(() => {});
+ 
+   // Which list item / card is the currently "selected" one. Stays highlighted
+   // until another item is clicked, or the map is dragged / scrolled.
+@@ -283,6 +286,33 @@ export default function Contact() {
+       return Math.max(0, bottom - c.top - VIEW_NUDGE_UP);
+     };
+ 
++    // Desktop twin of getOffsetY(): .page is a side panel covering the left
++    // part of the screen, so let the map slide right far enough that its left
++    // edge (and any card near it) can come out from behind the panel.
++    // 0 on mobile, where .page is a top bar instead.
++    const getOffsetX = () => {
++      const c = container.getBoundingClientRect();
++      const p = pageRef.current?.getBoundingClientRect();
++      if (!p || p.width >= c.width * 0.9 || p.height < c.height * 0.9) return 0;
++      return Math.max(0, p.right - c.left);
++    };
++
++    // How far the lowest card hangs below the bottom of the map image (cards
++    // near the bottom edge are taller than the space left under their cross).
++    // Measured, then cached until the next resize / image load, because
++    // getBounds() runs every frame and measuring 8 cards each frame is wasteful.
++    let cardOverflowY: number | null = null;
++    const getCardOverflowY = () => {
++      if (cardOverflowY !== null) return cardOverflowY;
++      const l = layer.getBoundingClientRect();
++      let overflow = 0;
++      cardRefs.current.forEach((card) => {
++        if (card) overflow = Math.max(overflow, card.getBoundingClientRect().bottom - l.bottom);
++      });
++      cardOverflowY = overflow + 16; // + a little breathing room
++      return cardOverflowY;
++    };
++
+     const getBounds = () => {
+       const scale = getMapScale();
+       const offsetY = getOffsetY();
+@@ -292,8 +322,11 @@ export default function Contact() {
+       // it can go (reaching the map's actual bottom edge). Adding offsetY to
+       // minY too would just shift the whole draggable range instead of
+       // growing it, making the bottom unreachable by the same amount.
+-      const minY = Math.min(0, container.clientHeight - layer.offsetHeight * scale);
+-      return { minX, maxX: 0, minY, maxY: offsetY };
++      const minY = Math.min(
++        0,
++        container.clientHeight - (layer.offsetHeight * scale + getCardOverflowY()),
++      );
++      return { minX, maxX: getOffsetX(), minY, maxY: offsetY };
+     };
+ 
+     const clampPos = (p: { x: number; y: number }) => {
+@@ -564,6 +597,7 @@ export default function Contact() {
+     // just getting clamped to a new edge.
+     let lastOffsetY = getOffsetY();
+     const handleResize = () => {
++      cardOverflowY = null; // card sizes may have changed (--card-scale)
+       const offsetY = getOffsetY();
+       pos.current.y += offsetY - lastOffsetY;
+       lastOffsetY = offsetY;
+@@ -621,6 +655,18 @@ export default function Contact() {
+       pressedKeys.current.clear();
+     };
+ 
++    // The map is sized to the screen in CSS, but its width is only known once
++    // the image has loaded — re-measure and re-centre then.
++    onMapLoad.current = () => {
++      cardOverflowY = null;
++      lastOffsetY = getOffsetY();
++      centerDefaultCard.current({ instant: true });
++    };
++    const mapImg = layer.querySelector("img");
++    if (mapImg instanceof HTMLImageElement && mapImg.complete && mapImg.naturalWidth) {
++      onMapLoad.current();
++    }
++
+     container.addEventListener("wheel", handleWheel, { passive: false });
+     container.addEventListener("pointerdown", handlePointerDown);
+     container.addEventListener("pointermove", handlePointerMove);
+@@ -746,13 +792,18 @@ export default function Contact() {
+         {/* Scaled down on small screens via CSS; crosses/cards counter-scale
+             back to full size (see Contact.module.scss) */}
+         <div ref={mapScaleRef} className={styles.mapScale}>
+-          <img src={map} alt="Map" className={styles.mapImage} />
++          <img
++            src={map}
++            alt=""
++            className={styles.mapImage}
++            onLoad={() => onMapLoad.current()}
++          />
+ 
+           {CONTACTS.map((c, i) => (
+             <img
+               key={`cross-${i}`}
+               src={cross}
+-              alt="Cross"
++              alt=""
+               className={styles.cross}
+               style={{ left: `${c.x}%`, top: `${c.y}%` }}
+             />
+diff --git a/src/styles/Contact.module.scss b/src/styles/Contact.module.scss
+index 1a5a651..10bf798 100644
+--- a/src/styles/Contact.module.scss
++++ b/src/styles/Contact.module.scss
+@@ -1,9 +1,9 @@
+ $cross-size: 80px; // change cross size here
+ $card-gap: -75px;   // extra space between the bottom of a cross and the top of a card (negative = overlap)
+-$mobile-card-gap: -125px; // same as $card-gap, but only for screens <= $mobile-breakpoint
+ $mobile-breakpoint: 729px;
+-$mobile-map-scale: 0.7;   // map image size on screens <= $mobile-breakpoint
+-$mobile-counter-scale: 1.2; // 1 / $mobile-map-scale — keeps crosses/cards at full size
++// Card size relative to its design size (362px wide). Smaller on short screens
++// so a card never covers most of the map. Set via --card-scale below.
++$card-scale-mobile: 0.84;
+ 
+ .mapContainer {
+   width: 100%;
+@@ -19,6 +19,20 @@ $mobile-counter-scale: 1.2; // 1 / $mobile-map-scale — keeps crosses/cards at
+ 
+   cursor: grab;
+ 
++  --card-scale: 1;
++
++  @media screen and (max-height: 1000px) {
++    --card-scale: 0.8;
++  }
++
++  @media screen and (max-height: 800px) {
++    --card-scale: 0.7;
++  }
++
++  @media screen and (max-width: $mobile-breakpoint) {
++    --card-scale: #{$card-scale-mobile};
++  }
++
+   &:active {
+     cursor: grabbing;
+   }
+@@ -36,20 +50,24 @@ $mobile-counter-scale: 1.2; // 1 / $mobile-map-scale — keeps crosses/cards at
+     pointer-events: none;
+   }
+ 
+-  /* Inner wrapper: same size as .mapLayer, holds the CSS-only mobile scale-down. */
++  /* Inner wrapper: same size as the map image. Crosses/cards are positioned
++     inside it with % left/top, so they follow the map at any size. */
+   .mapScale {
++    position: relative;
+     width: max-content;
+-    transform-origin: 0 0;
+-
+-    @media screen and (max-width: $mobile-breakpoint) {
+-      transform: scale($mobile-map-scale);
+-    }
+   }
+ 
++  /* The map is sized to the SCREEN, not to its own pixel size: exactly as tall
++     as the screen (so it's never blown up more than needed), and at least as
++     wide (so no empty strip on very wide screens). You pan sideways to see
++     the rest. object-fit only matters on ultra-wide screens, where it trims a
++     little top/bottom instead of stretching the picture. */
+   .mapImage {
+     display: block;
+-    height: auto;
++    height: 100dvh;
+     width: auto;
++    min-width: 100vw;
++    object-fit: cover;
+     pointer-events: none; /* Prevents default image ghost-dragging */
+   }
+ 
+@@ -63,9 +81,8 @@ $mobile-counter-scale: 1.2; // 1 / $mobile-map-scale — keeps crosses/cards at
+     z-index: 10;
+ 
+     @media screen and (max-width: $mobile-breakpoint) {
+-      /* Counters .mapScale's shrink so the cross stays full size, anchored
+-         at the same center point. */
+-      transform: translate(-50%, -170%) scale($mobile-counter-scale);
++      /* Same on-screen size/offset the mobile layout had before. */
++      transform: translate(-50%, calc(-50% - 66px)) scale($card-scale-mobile);
+     }
+   }
+ 
+@@ -74,13 +91,14 @@ $mobile-counter-scale: 1.2; // 1 / $mobile-map-scale — keeps crosses/cards at
+   .cardAnchor {
+     position: absolute;
+     width: max-content;
+-    transform: translate(-50%, calc(#{$cross-size * 0.5} + #{$card-gap}));
++    /* Scale from the card's top-centre so it shrinks toward its cross */
++    transform-origin: 50% 0;
++    transform: translate(-50%, calc(#{$cross-size * 0.5} + #{$card-gap}))
++      scale(var(--card-scale));
+ 
+     @media screen and (max-width: $mobile-breakpoint) {
+-      /* Counters .mapScale's shrink so the card stays full size, anchored
+-         at the same top point. Uses $mobile-card-gap, not $card-gap. */
+-      transform: translate(-50%, calc(#{$cross-size * 0.5} + #{$mobile-card-gap}))
+-        scale($mobile-counter-scale);
++      /* Same on-screen size/offset the mobile layout had before. */
++      transform: translate(-50%, -86px) scale(var(--card-scale));
+     }
+   }
+ 
+@@ -136,7 +154,7 @@ $mobile-counter-scale: 1.2; // 1 / $mobile-map-scale — keeps crosses/cards at
+   }
+ 
+   .page {
+-    height: 100vh;
++    height: 100dvh;
+     width: auto;
+     aspect-ratio: 767/1080;
+     background-image: url(../assets/contact/page.webp);
+@@ -174,12 +192,26 @@ $mobile-counter-scale: 1.2; // 1 / $mobile-map-scale — keeps crosses/cards at
+         }
+       }
+ 
++      /* 3D carved-gold heading: a light face, a stack of 1-step shadows that
++         get darker (the "thickness"), then a soft drop shadow and a warm glow.
++         All in em, so the depth scales with the font size on every screen. */
+       h1 {
+         font-family: 'Syamsiah', sans-serif;
+-        color: #866D52;
+         font-size: 7rem;
+         font-weight: 400;
+         margin-bottom: 0px;
++        color: #F7E2AE;
++        text-shadow:
++          0 0.008em 0 #E2C07E,
++          0 0.016em 0 #CFA765,
++          0 0.024em 0 #B98E4F,
++          0 0.032em 0 #A1773D,
++          0 0.040em 0 #88612F,
++          0 0.048em 0 #6E4C23,
++          0 0.056em 0 #553919,
++          0 0.07em 0.04em rgba(0, 0, 0, 0.6),
++          0 0.12em 0.14em rgba(0, 0, 0, 0.45),
++          0 0 0.3em rgba(255, 210, 130, 0.35);
+       }
+ 
+       ul {
+-- 
+2.43.0
+
+
+From 656a2415ab4868831b2c4a41fdbea8f8818f1b17 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 14 Oct 2026 10:10:19 +0000
+Subject: [PATCH 2/3] Contact: placeholder photos, smooth zoom-and-fly to
+ cards, keep cards fully in view
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01W6LfRMYSJ31Q7igqww8gGZ
+---
+ src/components/ContactCard.tsx |  28 ++-
+ src/pages/Contact.tsx          | 320 +++++++++++++++++++--------------
+ src/styles/Contact.module.scss |  75 ++++++--
+ 3 files changed, 272 insertions(+), 151 deletions(-)
+
+diff --git a/src/components/ContactCard.tsx b/src/components/ContactCard.tsx
+index d8803df..d1e0282 100644
+--- a/src/components/ContactCard.tsx
++++ b/src/components/ContactCard.tsx
+@@ -2,7 +2,7 @@ import styles from "../styles/Contact.module.scss";
+ import mail from "../assets/contact/mail.webp";
+ 
+ interface ContactCardProps {
+-  image: string;
++  image?: string; // leave out to show a placeholder
+   name: string;
+   email: string;
+ }
+@@ -27,12 +27,36 @@ function openGmailCompose(email: string) {
+   }
+ }
+ 
++// Shown instead of a photo: a sepia frame with a silhouette and initials.
++function PhotoPlaceholder({ name }: { name: string }) {
++  const initials = name
++    .split(" ")
++    .filter((w) => w.length > 1)
++    .slice(0, 2)
++    .map((w) => w[0])
++    .join("");
++  return (
++    <div className={styles.photoPlaceholder} role="img" aria-label={`Photo of ${name} coming soon`}>
++      <svg viewBox="0 0 100 90" aria-hidden="true">
++        <circle cx="50" cy="30" r="19" />
++        <path d="M8 90c0-25 18-38 42-38s42 13 42 38z" />
++      </svg>
++      <span className={styles.initials}>{initials}</span>
++      <span className={styles.soon}>Photo soon</span>
++    </div>
++  );
++}
++
+ export default function ContactCard({ image, name, email }: ContactCardProps) {
+   const handleMailClick = () => openGmailCompose(email);
+ 
+   return (
+     <div className={styles.cardContainer}>
+-      <img className={styles.stuccanImage} src={image} alt={name} />
++      {image ? (
++        <img className={styles.stuccanImage} src={image} alt={name} />
++      ) : (
++        <PhotoPlaceholder name={name} />
++      )}
+       <section className={styles.details}>
+         <h1>{name}</h1>
+         <img
+diff --git a/src/pages/Contact.tsx b/src/pages/Contact.tsx
+index 6876c37..d020838 100644
+--- a/src/pages/Contact.tsx
++++ b/src/pages/Contact.tsx
+@@ -5,14 +5,11 @@ import cross from "../assets/contact/cross.webp";
+ import styles from "../styles/Contact.module.scss";
+ import back from "../assets/contact/backButton.webp";
+ 
+-import dvm from "../assets/contact/avyaktVerma.webp";
+-import pcr from "../assets/contact/snehaSrivastava.jpeg";
+-import adp from "../assets/contact/devanshAgarwal.jpg";
+-import spons from "../assets/contact/prafulMalik.jpg";
+-import controls from "../assets/contact/shreyasAnand.webp";
+-import recnacc from "../assets/contact/prithviGowda.webp";
+-import prez from "../assets/contact/pulkitBhardwaj.webp";
+-import gensec from "../assets/contact/kushalPoosala.jpeg";
++// Team photos: none yet, every card shows a placeholder (see ContactCard).
++// To add one later: import it here, e.g.
++//   import pcr from "../assets/contact/snehaSrivastava.webp";
++// then set `image: pcr` on that person in CONTACTS below. The Preloader
++// picks it up automatically.
+ 
+ // ContactCard also imports this (for the on-card mail icon); imported again
+ // here purely so its URL can go in CONTACT_ASSETS below.
+@@ -38,61 +35,54 @@ import { useTransition } from "../context/TransitionProvider";
+ //   y: 0 = top edge,   100 = bottom edge
+ // The card sits just below its cross automatically.
+ // Pixel -> percent:  x% = pixelX / imageWidth * 100
++// image (optional): a photo URL; leave it out to show a placeholder.
+ // ─────────────────────────────────────────────────────────────
+-const CONTACTS = [
++const CONTACTS: { label: string; x: number; y: number; name: string; email: string; image?: string }[] = [
+   {
+     label: "Registrations and Correspondence",
+     x: 72, y: 76,
+-    image: pcr,
+     name: "Sneha Srivastava",
+     email: "f20230855@pilani.bits-pilani.ac.in",
+   },
+   {
+     label: "Website, App and Payments",
+     x: 79.5, y: 45,
+-    image: dvm, // TODO: replace
+     name: "Avyakt Verma",
+     email: "f20231083@pilani.bits-pilani.ac.in",
+   },
+   {
+     label: "Sponsorships and Company Collaborations",
+     x: 63, y: 40,
+-    image: spons, // TODO: replace
+     name: "Praful Malik",
+     email: "f20240605@pilani.bits-pilani.ac.in",
+   },
+   {
+     label: "Logistics and Operations",
+     x: 48, y: 54,
+-    image: controls, // TODO: replace
+     name: "Shreyas Anand",
+     email: "f20230906@pilani.bits-pilani.ac.in",
+   },
+   {
+     label: "Reception and Accommodation",
+     x: 33, y: 71,
+-    image: recnacc, // TODO: replace
+     name: "Prithvi Gowda C",
+     email: "f20230327@pilani.bits-pilani.ac.in",
+   },
+   {
+     label: "Online Collaborations and Publicity",
+     x: 34, y: 20,
+-    image: adp, // TODO: replace
+     name: "Devansh Agarwal",
+     email: "f20230812@pilani.bits-pilani.ac.in",
+   },
+   {
+     label: "President, Students' Union",
+     x: 50, y: 15,
+-    image: prez, // TODO: replace
+     name: "Pulkit Bhardwaj",
+     email: "president@pilani.bits-pilani.ac.in",
+   },
+   {
+     label: "General Secretary, Students' Union",
+     x: 68, y: 12,
+-    image: gensec, // TODO: replace
+     name: "Kushal Poosala",
+     email: "gensec@pilani.bits-pilani.ac.in",
+   },
+@@ -121,14 +111,7 @@ const CONTACT_ASSETS = [
+   cardBg,
+   pageBg,
+   pageMobBg,
+-  dvm,
+-  pcr,
+-  adp,
+-  spons,
+-  controls,
+-  recnacc,
+-  prez,
+-  gensec
++  ...CONTACTS.flatMap((c) => (c.image ? [c.image] : [])),
+ ];
+ 
+ // Keyboard controls. Uses e.code (physical keys), so W/A/S/D work on any
+@@ -148,6 +131,31 @@ const LIST_PEEK_PADDING = 6;
+ // Pixels per frame the map moves while a movement key is held.
+ const KEY_SPEED = 12;
+ 
++// ── Zoom & "fly to card" ──
++// Zoom used when a contact is clicked (1 = whole map height on screen).
++const FOCUS_ZOOM = 1.45;
++const MIN_ZOOM = 1;
++const MAX_ZOOM = 2.2;
++// How long the fly-to-card animation takes, in ms.
++const FLY_MS = 900;
++// Card design size in px (see .cardContainer in the SCSS) and the range
++// its on-screen scale may take (set automatically to fit the window).
++const CARD_W = 362;
++const CARD_H = 381;
++const CARD_SCALE_MIN = 0.35;
++const CARD_SCALE_MAX = 0.9;
++// Gap kept between a card and the screen edge when it's at the map's edge.
++const CARD_EDGE_PADDING = 16;
++
++type Camera = { x: number; y: number; z: number };
++type Flight = { from: Camera; to: Camera; ms: number; dip: number; t0: number };
++
++const easeInOutCubic = (t: number) =>
++  t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
++const prefersReducedMotion = () =>
++  typeof window !== "undefined" &&
++  !!window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
++
+ export default function Contact() {
+   const { entered, markEntered, transitioning } = useTransition();
+ 
+@@ -162,8 +170,10 @@ export default function Contact() {
+   const pos = useRef({ x: 0, y: 0 });
+   // Velocity vector (used ONLY for mouse/touch flick momentum)
+   const vel = useRef({ x: 0, y: 0 });
+-  // Where an automatic "scroll to card" is heading (null = no auto-scroll running)
+-  const target = useRef<{ x: number; y: number } | null>(null);
++  // Zoom level of the map (1 = map exactly fits the screen height)
++  const zoom = useRef(1);
++  // An in-progress "fly to a card" animation (null = none running)
++  const flight = useRef<Flight | null>(null);
+ 
+   const isDragging = useRef(false); // pointer is down
+   const didDrag = useRef(false); // pointer moved far enough to count as a drag
+@@ -213,8 +223,6 @@ export default function Contact() {
+   const TOUCHPAD_GESTURE_GAP = 120;
+   // Pixels the pointer must move before a press becomes a drag (keeps clicks working)
+   const DRAG_THRESHOLD = 5;
+-  // Speed of the automatic scroll to a card (0.05 = slow/smooth, 0.2 = fast)
+-  const AUTO_SCROLL_EASING = 0.08;
+   // Reduces how far down the map can shift to reveal content hidden behind
+   // .page (see getOffsetY() below) — so BOTH the initial view AND the
+   // furthest-down drag position sit this many px higher than the "fully
+@@ -234,20 +242,6 @@ export default function Contact() {
+     const layer = layerRef.current;
+     if (!container || !layer) return;
+ 
+-    // The map image itself may be scaled down by CSS (see the .mapScale rule
+-    // in the SCSS — currently only on small screens, but this reads the real
+-    // rendered scale rather than assuming a breakpoint/value, so it can never
+-    // drift out of sync with the stylesheet again). Crosses/cards counter-scale
+-    // back to full size there, so only the image's own footprint shrinks.
+-    const getMapScale = () => {
+-      const el = mapScaleRef.current;
+-      if (!el) return 1;
+-      const transform = getComputedStyle(el).transform;
+-      if (!transform || transform === "none") return 1; // not scaled (e.g. desktop)
+-      const matrix = new DOMMatrixReadOnly(transform);
+-      return matrix.a || 1; // matrix.a is scaleX; 0 would mean "not measurable"
+-    };
+-
+     // .page pins to the top of the screen on small screens and never moves,
+     // so whatever's directly under it is always hidden. But .page's own box
+     // is taller than what's actually drawn there: the parchment graphic lives
+@@ -287,8 +281,7 @@ export default function Contact() {
+     };
+ 
+     // Desktop twin of getOffsetY(): .page is a side panel covering the left
+-    // part of the screen, so let the map slide right far enough that its left
+-    // edge (and any card near it) can come out from behind the panel.
++    // part of the screen, so the visible map area starts at its right edge.
+     // 0 on mobile, where .page is a top bar instead.
+     const getOffsetX = () => {
+       const c = container.getBoundingClientRect();
+@@ -297,43 +290,73 @@ export default function Contact() {
+       return Math.max(0, p.right - c.left);
+     };
+ 
+-    // How far the lowest card hangs below the bottom of the map image (cards
+-    // near the bottom edge are taller than the space left under their cross).
++    // The part of the screen the map is actually visible in (not under .page),
++    // in container coordinates.
++    const getVisibleArea = () => ({
++      left: getOffsetX(),
++      top: getOffsetY(),
++      right: container.clientWidth,
++      bottom: container.clientHeight,
++    });
++
++    // Everything that can be panned to, in UN-zoomed map-layer coordinates:
++    // the map image, grown to include any card hanging off its edges, so a
++    // card near an edge can always be brought fully into view (the old
++    // bounds stopped at the map edge, which left those cards half cut off).
+     // Measured, then cached until the next resize / image load, because
+-    // getBounds() runs every frame and measuring 8 cards each frame is wasteful.
+-    let cardOverflowY: number | null = null;
+-    const getCardOverflowY = () => {
+-      if (cardOverflowY !== null) return cardOverflowY;
++    // getBounds() runs every frame.
++    let panBox: { l: number; t: number; r: number; b: number } | null = null;
++    const getPanBox = () => {
++      if (panBox) return panBox;
+       const l = layer.getBoundingClientRect();
+-      let overflow = 0;
++      const z = zoom.current;
++      const box = { l: 0, t: 0, r: layer.offsetWidth, b: layer.offsetHeight };
+       cardRefs.current.forEach((card) => {
+-        if (card) overflow = Math.max(overflow, card.getBoundingClientRect().bottom - l.bottom);
++        if (!card) return;
++        const r = card.getBoundingClientRect();
++        box.l = Math.min(box.l, (r.left - l.left) / z - CARD_EDGE_PADDING);
++        box.t = Math.min(box.t, (r.top - l.top) / z - CARD_EDGE_PADDING);
++        box.r = Math.max(box.r, (r.right - l.left) / z + CARD_EDGE_PADDING);
++        box.b = Math.max(box.b, (r.bottom - l.top) / z + CARD_EDGE_PADDING);
+       });
+-      cardOverflowY = overflow + 16; // + a little breathing room
+-      return cardOverflowY;
++      panBox = box;
++      return box;
+     };
+ 
+-    const getBounds = () => {
+-      const scale = getMapScale();
+-      const offsetY = getOffsetY();
+-      const minX = Math.min(0, container.clientWidth - layer.offsetWidth * scale);
+-      // Only maxY gets the offset — this EXTENDS how far down the map can go
+-      // (to reveal what's hidden behind .page) without eating into how far up
+-      // it can go (reaching the map's actual bottom edge). Adding offsetY to
+-      // minY too would just shift the whole draggable range instead of
+-      // growing it, making the bottom unreachable by the same amount.
+-      const minY = Math.min(
+-        0,
+-        container.clientHeight - (layer.offsetHeight * scale + getCardOverflowY()),
++    // Card size: chosen so that a card, once flown to (at FOCUS_ZOOM), fills
++    // about 70% of the visible map area, whatever the window size. This is
++    // what stops a card being bigger than a narrow window and landing cut off.
++    const fitCardScale = () => {
++      const v = getVisibleArea();
++      const w = v.right - v.left;
++      const h = v.bottom - v.top;
++      const s = Math.min((w * 0.72) / CARD_W, (h * 0.66) / CARD_H) / FOCUS_ZOOM;
++      container.style.setProperty(
++        "--card-scale",
++        Math.min(CARD_SCALE_MAX, Math.max(CARD_SCALE_MIN, s)).toFixed(3),
+       );
+-      return { minX, maxX: getOffsetX(), minY, maxY: offsetY };
++      panBox = null; // card sizes changed
+     };
+ 
+-    const clampPos = (p: { x: number; y: number }) => {
+-      const { minX, maxX, minY, maxY } = getBounds();
++    const getBounds = (z = zoom.current) => {
++      const v = getVisibleArea();
++      const box = getPanBox();
++      // Map edges may not come inside the visible area (no dark gaps), except
++      // as far as a card overhanging that edge needs.
+       return {
+-        x: Math.max(minX, Math.min(maxX, p.x)),
+-        y: Math.max(minY, Math.min(maxY, p.y)),
++        minX: v.right - box.r * z,
++        maxX: v.left - box.l * z,
++        minY: v.bottom - box.b * z,
++        maxY: v.top - box.t * z,
++      };
++    };
++
++    const clampPos = (p: { x: number; y: number }, z = zoom.current) => {
++      const { minX, maxX, minY, maxY } = getBounds(z);
++      // If the content is smaller than the view on an axis, centre it.
++      return {
++        x: minX > maxX ? (minX + maxX) / 2 : Math.max(minX, Math.min(maxX, p.x)),
++        y: minY > maxY ? (minY + maxY) / 2 : Math.max(minY, Math.min(maxY, p.y)),
+       };
+     };
+ 
+@@ -342,67 +365,79 @@ export default function Contact() {
+     const isOverPage = (e: Event) =>
+       !!pageRef.current && pageRef.current.contains(e.target as Node);
+ 
+-    // Where pos.{x,y} would need to be for the given card to sit centred in
+-    // the visible map area (the part of the screen not covered by .page,
+-    // whichever side it's on: a side panel narrows it from the left on
+-    // desktop, a top bar narrows it from the top on mobile — using the same
+-    // real obstruction measurement as getOffsetY(), so this is correct
+-    // whether .page is collapsed or expanded). Returns null if that card
+-    // isn't rendered (bad index, or called before refs are attached).
+-    // Unclamped — callers decide whether/how to clamp.
+-    const getCardCenterTarget = (index: number): { x: number; y: number } | null => {
++    // Where the camera must be for the given card to sit centred in the
++    // visible map area at zoom z. Returns null if that card isn't rendered.
++    const getCardCenterTarget = (index: number, z: number): Camera | null => {
+       const card = cardRefs.current[index];
+       if (!card) return null;
+ 
+-      const c = container.getBoundingClientRect();
++      const v = getVisibleArea();
+       const l = layer.getBoundingClientRect();
+       const r = card.getBoundingClientRect();
+-      const p = pageRef.current?.getBoundingClientRect();
++      const zNow = zoom.current;
+ 
+-      const pageBottom = getPageBottom();
+-      const visibleLeft = p && p.width < c.width * 0.9 ? p.right : c.left;
+-      const visibleTop = pageBottom ?? c.top;
+-      const centerX = (visibleLeft + c.right) / 2 - c.left;
+-      const centerY = (visibleTop + c.bottom) / 2 - c.top;
++      // Card centre in UN-zoomed map-layer coordinates
++      const cardX = (r.left + r.width / 2 - l.left) / zNow;
++      const cardY = (r.top + r.height / 2 - l.top) / zNow;
+ 
+-      // Card centre in the map layer's own coordinates
+-      const cardX = r.left + r.width / 2 - l.left;
+-      const cardY = r.top + r.height / 2 - l.top;
++      const centerX = (v.left + v.right) / 2;
++      const centerY = (v.top + v.bottom) / 2;
++      return { ...clampPos({ x: centerX - cardX * z, y: centerY - cardY * z }, z), z };
++    };
+ 
+-      return { x: centerX - cardX, y: centerY - cardY };
++    // Fly the camera to `to`: ONE smooth, time-based move (same duration on a
++    // 60Hz or 120Hz screen), easing in and out. On long hops it zooms out a
++    // little mid-way and back in, like a maps app, so you can see where
++    // you're going. Replaces the old "move 8% closer every frame" glide,
++    // which lurched at the start and crawled at the end.
++    const flyTo = (to: Camera, ms = FLY_MS) => {
++      isFlicking.current = false;
++      vel.current = { x: 0, y: 0 };
++      if (prefersReducedMotion()) {
++        pos.current = { x: to.x, y: to.y };
++        zoom.current = to.z;
++        flight.current = null;
++        return;
++      }
++      const from = { x: pos.current.x, y: pos.current.y, z: zoom.current };
++      const dist = Math.hypot(to.x - from.x, to.y - from.y);
++      flight.current = { from, to, ms, dip: Math.min(0.5, dist / 1600), t0: performance.now() };
+     };
+ 
+-    // Centers on DEFAULT_CARD_INDEX's card, so the page doesn't open on an
+-    // arbitrary corner of the map. Falls back to the old "just reveal what's
+-    // behind .page" behaviour if that card isn't renderable for some reason
+-    // (e.g. CONTACTS was shortened and the index is now out of range).
+-    // instant=true snaps pos.current directly (used for the very first guess,
+-    // below); instant=false (default) eases smoothly via target.current, for
+-    // the later correction in the font/transition-settle effect — by then the
+-    // page may already be visible, so a sudden snap would be jarring.
++    // Centers on DEFAULT_CARD_INDEX's card, zoomed in, so the page doesn't
++    // open on an arbitrary corner of the map. instant=true snaps (first
++    // guess at mount); instant=false flies there (later correction once fonts
++    // and the page transition have settled).
+     centerDefaultCard.current = ({ instant = false } = {}) => {
+-      const t = clampPos(
+-        getCardCenterTarget(DEFAULT_CARD_INDEX) ?? { x: pos.current.x, y: getOffsetY() },
+-      );
++      fitCardScale();
++      const t = getCardCenterTarget(DEFAULT_CARD_INDEX, FOCUS_ZOOM) ?? {
++        ...clampPos({ x: pos.current.x, y: getOffsetY() }),
++        z: zoom.current,
++      };
+       if (instant) {
+-        pos.current = t;
++        flight.current = null;
++        pos.current = { x: t.x, y: t.y };
++        zoom.current = t.z;
+       } else {
+-        isFlicking.current = false;
+-        vel.current = { x: 0, y: 0 };
+-        target.current = t;
++        flyTo(t, 500);
+       }
+     };
+     centerDefaultCard.current({ instant: true });
+     setActive(DEFAULT_CARD_INDEX);
+ 
+-    // Smoothly move the map so the chosen card is centred in the visible map area
++    // Zoom in on the chosen card and fly to it
+     scrollToCard.current = (index: number) => {
+-      const raw = getCardCenterTarget(index);
+-      if (!raw) return;
++      const t = getCardCenterTarget(index, FOCUS_ZOOM);
++      if (t) flyTo(t);
++    };
+ 
+-      isFlicking.current = false;
+-      vel.current = { x: 0, y: 0 };
+-      target.current = clampPos(raw);
++    // Zoom by a factor around a point on screen (container coordinates),
++    // keeping that point still. Used by Ctrl+wheel / touchpad pinch.
++    const zoomAround = (px: number, py: number, factor: number) => {
++      const z = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, zoom.current * factor));
++      const k = z / zoom.current;
++      zoom.current = z;
++      pos.current = clampPos({ x: px - (px - pos.current.x) * k, y: py - (py - pos.current.y) * k });
+     };
+ 
+     // 1. Wheel input. Two very different devices send "wheel" events:
+@@ -435,7 +470,14 @@ export default function Contact() {
+       }
+ 
+       e.preventDefault();
+-      if (e.ctrlKey) return; // pinch-zoom gesture: ignore
++      // Ctrl+wheel / touchpad pinch: zoom around the pointer
++      if (e.ctrlKey) {
++        flight.current = null;
++        isFlicking.current = false;
++        const c = container.getBoundingClientRect();
++        zoomAround(e.clientX - c.left, e.clientY - c.top, Math.exp(-e.deltaY * 0.01));
++        return;
++      }
+ 
+       const now = performance.now();
+ 
+@@ -461,7 +503,7 @@ export default function Contact() {
+ 
+       // Cancel any ongoing momentum / auto-scroll
+       isFlicking.current = false;
+-      target.current = null;
++      flight.current = null;
+       vel.current = { x: 0, y: 0 };
+       setActive(null);
+ 
+@@ -483,7 +525,7 @@ export default function Contact() {
+       isDragging.current = true;
+       didDrag.current = false;
+       isFlicking.current = false;
+-      target.current = null;
++      flight.current = null;
+       startPointer.current = { x: e.clientX, y: e.clientY };
+       lastPointer.current = { x: e.clientX, y: e.clientY };
+       vel.current = { x: 0, y: 0 };
+@@ -556,17 +598,30 @@ export default function Contact() {
+         }
+       }
+ 
+-      // Automatic scroll to a card (eases toward the target)
+-      if (target.current) {
+-        const dx = target.current.x - pos.current.x;
+-        const dy = target.current.y - pos.current.y;
+-
+-        if (Math.abs(dx) < 0.5 && Math.abs(dy) < 0.5) {
+-          pos.current = { ...target.current };
+-          target.current = null;
+-        } else {
+-          pos.current.x += dx * AUTO_SCROLL_EASING;
+-          pos.current.y += dy * AUTO_SCROLL_EASING;
++      // Fly-to-card animation (time-based, see flyTo)
++      if (flight.current) {
++        const { from, to, ms, dip, t0 } = flight.current;
++        const t = Math.min(1, (performance.now() - t0) / ms);
++        const e = easeInOutCubic(t);
++        // Zoom: ease from -> to, dipping out a little mid-way on long hops
++        const z = Math.max(MIN_ZOOM, from.z + (to.z - from.z) * e - dip * Math.sin(Math.PI * t));
++        // Pan: move the map point under the view centre in a straight line,
++        // so pan and zoom stay in step (no sideways swing while zooming).
++        const v = getVisibleArea();
++        const cx = (v.left + v.right) / 2;
++        const cy = (v.top + v.bottom) / 2;
++        const fx = (cx - from.x) / from.z;
++        const fy = (cy - from.y) / from.z;
++        const tx = (cx - to.x) / to.z;
++        const ty = (cy - to.y) / to.z;
++        const px = fx + (tx - fx) * e;
++        const py = fy + (ty - fy) * e;
++        zoom.current = z;
++        pos.current = { x: cx - px * z, y: cy - py * z };
++        if (t >= 1) {
++          pos.current = { x: to.x, y: to.y };
++          zoom.current = to.z;
++          flight.current = null;
+         }
+       }
+ 
+@@ -585,7 +640,7 @@ export default function Contact() {
+       }
+ 
+       // The whole layer (map image + crosses + cards) moves together
+-      layer.style.transform = `translate3d(${pos.current.x}px, ${pos.current.y}px, 0px)`;
++      layer.style.transform = `translate3d(${pos.current.x}px, ${pos.current.y}px, 0px) scale(${zoom.current})`;
+ 
+       animFrameId.current = requestAnimationFrame(render);
+     };
+@@ -597,7 +652,7 @@ export default function Contact() {
+     // just getting clamped to a new edge.
+     let lastOffsetY = getOffsetY();
+     const handleResize = () => {
+-      cardOverflowY = null; // card sizes may have changed (--card-scale)
++      fitCardScale(); // window size changed: re-fit cards (also resets panBox)
+       const offsetY = getOffsetY();
+       pos.current.y += offsetY - lastOffsetY;
+       lastOffsetY = offsetY;
+@@ -641,7 +696,7 @@ export default function Contact() {
+ 
+       // Start / continue panning; cancel any glide or auto-scroll in progress
+       isFlicking.current = false;
+-      target.current = null;
++      flight.current = null;
+       vel.current = { x: 0, y: 0 };
+       pressedKeys.current.add(e.code);
+     };
+@@ -658,7 +713,6 @@ export default function Contact() {
+     // The map is sized to the screen in CSS, but its width is only known once
+     // the image has loaded — re-measure and re-centre then.
+     onMapLoad.current = () => {
+-      cardOverflowY = null;
+       lastOffsetY = getOffsetY();
+       centerDefaultCard.current({ instant: true });
+     };
+@@ -804,7 +858,7 @@ export default function Contact() {
+               key={`cross-${i}`}
+               src={cross}
+               alt=""
+-              className={styles.cross}
++              className={`${styles.cross} ${i === activeIndex ? styles.crossActive : ""}`}
+               style={{ left: `${c.x}%`, top: `${c.y}%` }}
+             />
+           ))}
+@@ -816,7 +870,7 @@ export default function Contact() {
+               ref={(el) => {
+                 cardRefs.current[i] = el;
+               }}
+-              className={styles.cardAnchor}
++              className={`${styles.cardAnchor} ${i === activeIndex ? styles.cardActive : ""}`}
+               style={{ left: `${c.x}%`, top: `${c.y}%` }}
+             >
+               <ContactCard image={c.image} name={c.name} email={c.email} />
+diff --git a/src/styles/Contact.module.scss b/src/styles/Contact.module.scss
+index 10bf798..775b2ae 100644
+--- a/src/styles/Contact.module.scss
++++ b/src/styles/Contact.module.scss
+@@ -1,9 +1,7 @@
+ $cross-size: 80px; // change cross size here
+ $card-gap: -75px;   // extra space between the bottom of a cross and the top of a card (negative = overlap)
+ $mobile-breakpoint: 729px;
+-// Card size relative to its design size (362px wide). Smaller on short screens
+-// so a card never covers most of the map. Set via --card-scale below.
+-$card-scale-mobile: 0.84;
++$card-scale-mobile: 0.84; // cross size on mobile (cards are sized by Contact.tsx)
+ 
+ .mapContainer {
+   width: 100%;
+@@ -19,19 +17,10 @@ $card-scale-mobile: 0.84;
+ 
+   cursor: grab;
+ 
+-  --card-scale: 1;
+-
+-  @media screen and (max-height: 1000px) {
+-    --card-scale: 0.8;
+-  }
+-
+-  @media screen and (max-height: 800px) {
+-    --card-scale: 0.7;
+-  }
+-
+-  @media screen and (max-width: $mobile-breakpoint) {
+-    --card-scale: #{$card-scale-mobile};
+-  }
++  /* Fallback only: Contact.tsx sets --card-scale on this element to fit
++     the window (fitCardScale), so a zoomed-in card fills ~70% of the
++     visible map area on any screen size. */
++  --card-scale: 0.6;
+ 
+   &:active {
+     cursor: grabbing;
+@@ -79,6 +68,11 @@ $card-scale-mobile: 0.84;
+     transform: translate(-50%, -50%); /* left/top = center of the cross */
+     pointer-events: none;
+     z-index: 10;
++    transition: filter 0.4s ease;
++
++    &.crossActive {
++      filter: drop-shadow(0 0 10px rgba(255, 205, 120, 0.9));
++    }
+ 
+     @media screen and (max-width: $mobile-breakpoint) {
+       /* Same on-screen size/offset the mobile layout had before. */
+@@ -96,6 +90,16 @@ $card-scale-mobile: 0.84;
+     transform: translate(-50%, calc(#{$cross-size * 0.5} + #{$card-gap}))
+       scale(var(--card-scale));
+ 
++    .cardContainer {
++      transition: filter 0.5s ease, transform 0.5s cubic-bezier(0.2, 0.9, 0.3, 1.3);
++    }
++
++    /* The card you just flew to: warm glow + a small pop */
++    &.cardActive .cardContainer {
++      filter: drop-shadow(0 0 22px rgba(255, 205, 120, 0.75));
++      transform: scale(1.04);
++    }
++
+     @media screen and (max-width: $mobile-breakpoint) {
+       /* Same on-screen size/offset the mobile layout had before. */
+       transform: translate(-50%, -86px) scale(var(--card-scale));
+@@ -124,6 +128,45 @@ $card-scale-mobile: 0.84;
+       height: auto;
+     }
+ 
++    /* Shown instead of a photo (see PhotoPlaceholder in ContactCard.tsx) */
++    .photoPlaceholder {
++      width: 310px;
++      aspect-ratio: 318/287;
++      position: relative;
++      overflow: hidden;
++      background: radial-gradient(120% 90% at 50% 30%, #C9AE83, #8E7352);
++
++      svg {
++        position: absolute;
++        bottom: 0;
++        left: 19%;
++        width: 62%;
++        fill: rgba(53, 51, 45, 0.55);
++      }
++
++      .initials {
++        position: absolute;
++        top: 12px;
++        right: 14px;
++        font-family: 'EB', serif;
++        font-size: 1.15rem;
++        letter-spacing: 0.08em;
++        color: #35332D;
++        opacity: 0.7;
++      }
++
++      .soon {
++        position: absolute;
++        bottom: 10px;
++        left: 14px;
++        font-family: 'EB', serif;
++        font-size: 0.8rem;
++        letter-spacing: 0.1em;
++        text-transform: uppercase;
++        color: #F4E7CC;
++      }
++    }
++
+     .details {
+       display: flex;
+       width: 310px;
+-- 
+2.43.0
+
+
+From 4b2e40463f52958db74b6c1d7252401b4618d31f Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 14 Oct 2026 10:15:02 +0000
+Subject: [PATCH 3/3] Contact: show only the selected card, smaller cards,
+ clickable pins
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01W6LfRMYSJ31Q7igqww8gGZ
+---
+ src/pages/Contact.tsx          | 16 +++++++-----
+ src/styles/Contact.module.scss | 45 +++++++++++++++++++++++++---------
+ 2 files changed, 43 insertions(+), 18 deletions(-)
+
+diff --git a/src/pages/Contact.tsx b/src/pages/Contact.tsx
+index d020838..745c6e1 100644
+--- a/src/pages/Contact.tsx
++++ b/src/pages/Contact.tsx
+@@ -142,8 +142,8 @@ const FLY_MS = 900;
+ // its on-screen scale may take (set automatically to fit the window).
+ const CARD_W = 362;
+ const CARD_H = 381;
+-const CARD_SCALE_MIN = 0.35;
+-const CARD_SCALE_MAX = 0.9;
++const CARD_SCALE_MIN = 0.3;
++const CARD_SCALE_MAX = 0.6;
+ // Gap kept between a card and the screen edge when it's at the map's edge.
+ const CARD_EDGE_PADDING = 16;
+ 
+@@ -324,13 +324,13 @@ export default function Contact() {
+     };
+ 
+     // Card size: chosen so that a card, once flown to (at FOCUS_ZOOM), fills
+-    // about 70% of the visible map area, whatever the window size. This is
+-    // what stops a card being bigger than a narrow window and landing cut off.
++    // under half of the visible map area, whatever the window size, so the
++    // map around it stays visible and a card never lands cut off.
+     const fitCardScale = () => {
+       const v = getVisibleArea();
+       const w = v.right - v.left;
+       const h = v.bottom - v.top;
+-      const s = Math.min((w * 0.72) / CARD_W, (h * 0.66) / CARD_H) / FOCUS_ZOOM;
++      const s = Math.min((w * 0.45) / CARD_W, (h * 0.45) / CARD_H) / FOCUS_ZOOM;
+       container.style.setProperty(
+         "--card-scale",
+         Math.min(CARD_SCALE_MAX, Math.max(CARD_SCALE_MIN, s)).toFixed(3),
+@@ -859,11 +859,15 @@ export default function Contact() {
+               src={cross}
+               alt=""
+               className={`${styles.cross} ${i === activeIndex ? styles.crossActive : ""}`}
++              title={`${c.name} — ${c.label}`}
++              onClick={() => handleListClick(i)}
+               style={{ left: `${c.x}%`, top: `${c.y}%` }}
+             />
+           ))}
+ 
+-          {/* Cards sit just below their crosses (offset handled in the SCSS) */}
++          {/* Cards sit just below their crosses (offset handled in the SCSS).
++              Only the selected one is shown; the rest stay hidden so the map
++              isn't covered. Click a cross (pin) or a list item to open one. */}
+           {CONTACTS.map((c, i) => (
+             <div
+               key={`card-${i}`}
+diff --git a/src/styles/Contact.module.scss b/src/styles/Contact.module.scss
+index 775b2ae..6c8f609 100644
+--- a/src/styles/Contact.module.scss
++++ b/src/styles/Contact.module.scss
+@@ -1,4 +1,4 @@
+-$cross-size: 80px; // change cross size here
++$cross-size: 56px; // change cross (pin) size here
+ $card-gap: -75px;   // extra space between the bottom of a cross and the top of a card (negative = overlap)
+ $mobile-breakpoint: 729px;
+ $card-scale-mobile: 0.84; // cross size on mobile (cards are sized by Contact.tsx)
+@@ -20,7 +20,7 @@ $card-scale-mobile: 0.84; // cross size on mobile (cards are sized by Contact.ts
+   /* Fallback only: Contact.tsx sets --card-scale on this element to fit
+      the window (fitCardScale), so a zoomed-in card fills ~70% of the
+      visible map area on any screen size. */
+-  --card-scale: 0.6;
++  --card-scale: 0.45;
+ 
+   &:active {
+     cursor: grabbing;
+@@ -66,9 +66,16 @@ $card-scale-mobile: 0.84; // cross size on mobile (cards are sized by Contact.ts
+     width: $cross-size;
+     height: auto;
+     transform: translate(-50%, -50%); /* left/top = center of the cross */
+-    pointer-events: none;
++    /* Crosses are clickable pins (the map layer itself has pointer-events: none) */
++    pointer-events: auto;
++    cursor: pointer;
+     z-index: 10;
+-    transition: filter 0.4s ease;
++    transition: filter 0.4s ease, scale 0.2s ease;
++
++    &:hover {
++      scale: 1.15;
++      filter: drop-shadow(0 0 8px rgba(255, 205, 120, 0.8));
++    }
+ 
+     &.crossActive {
+       filter: drop-shadow(0 0 10px rgba(255, 205, 120, 0.9));
+@@ -90,14 +97,28 @@ $card-scale-mobile: 0.84; // cross size on mobile (cards are sized by Contact.ts
+     transform: translate(-50%, calc(#{$cross-size * 0.5} + #{$card-gap}))
+       scale(var(--card-scale));
+ 
+-    .cardContainer {
+-      transition: filter 0.5s ease, transform 0.5s cubic-bezier(0.2, 0.9, 0.3, 1.3);
+-    }
+-
+-    /* The card you just flew to: warm glow + a small pop */
+-    &.cardActive .cardContainer {
+-      filter: drop-shadow(0 0 22px rgba(255, 205, 120, 0.75));
+-      transform: scale(1.04);
++    z-index: 11;
++
++    /* Hidden unless selected, so the cards don't cover the whole map.
++       (visibility waits for the fade-out, then also stops the hidden mail
++       icon from being clickable.) */
++    opacity: 0;
++    visibility: hidden;
++    translate: 0 14px;
++    transition: opacity 0.35s ease, translate 0.45s cubic-bezier(0.2, 0.9, 0.3, 1.2),
++      visibility 0s linear 0.35s;
++
++    /* The selected card: fades and rises in near the end of the fly-to */
++    &.cardActive {
++      opacity: 1;
++      visibility: visible;
++      translate: 0 0;
++      transition: opacity 0.35s ease 0.25s, translate 0.5s cubic-bezier(0.2, 0.9, 0.3, 1.2) 0.25s,
++        visibility 0s;
++
++      .cardContainer {
++        filter: drop-shadow(0 0 18px rgba(255, 205, 120, 0.6));
++      }
+     }
+ 
+     @media screen and (max-width: $mobile-breakpoint) {
+-- 
+2.43.0
+
